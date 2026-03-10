@@ -28,7 +28,7 @@ def get_optimization_method(
         run = db[uid]
         outcomes = []
         spectrum_data = np.array(run["primary"]["data"][peak_spectrum_x_dkey][-1])
- 
+
         energy_grid = np.array(run["primary"]["data"][peak_spectrum_y_dkey][-1])
         for suggestion in suggestions:
             idx = suggestion["_id"]
@@ -56,24 +56,23 @@ def get_optimization_method(
 def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
     if sensors is None:
         sensors = []
-    
+
     readables = [s for s in sensors if hasattr(s, "read")]
     md = {"blop_suggestions": suggestions}
-    
-    def per_step(detectors, step, pos_cache): # step should be a dict of {motor: value}
 
+    def per_step(detectors, step, pos_cache):  # step is a dict of {motor: value}
         move_args = []
         for motor, position in step.items():
             move_args.extend([motor, position])
         yield from bps.mv(*move_args)
         yield from bps.trigger_and_read(list(detectors) + list(step.keys()))
-    
+
     # build list_scan args
     plan_args = []
     for actuator in actuators:
         plan_args.append(actuator)
         plan_args.append([s[actuator.name] for s in suggestions])
-    
+
     return (
         yield from bp.list_scan(
             readables,
@@ -83,6 +82,7 @@ def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
             **kwargs,
         )
     )
+
 
 @parameter_annotation_decorator(
     {
@@ -108,7 +108,6 @@ def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
         }
     }
 )
-
 def blop_peak_scan(
     iterations: int,
     energy_start: float,
@@ -129,9 +128,7 @@ def blop_peak_scan(
     r2_start: float = 0.0,
     r2_end: float = 0.0,
 ):
-    """
-    Perform a grid scan using BLOP.
-    """
+
 
     peak: PeakController = devices_dictionary.get("peak_controller")
     manipulator: SISSY1Manipulator = devices_dictionary.get("manipulator")
@@ -154,7 +151,7 @@ def blop_peak_scan(
     (r2_start, r2_end) = (min(r2_start, r2_end), max(r2_start, r2_end))
 
     motors, dofs = [], []
-    # I don't want to have to use getattr, so we'll do it all explicitly even though a loop would be cleaner.
+    
     if use_x:
         motors.append(manipulator.x.name)
         dofs.append(
@@ -203,22 +200,18 @@ def blop_peak_scan(
     objectives = [
         Objective(name="integrated_signal", minimize=False),
     ]
-    # global LAST_AGENT
-    # if LAST_AGENT is not None and LAST_AGENT.dofs == dofs:
-    #     print("Using last agent since DOF match.")
-    #     agent = LAST_AGENT
-    # else:
+
     print("Creating new agent.")
     agent = Agent(
-        readables=[peak],
+        sensors=[peak],                          
         dofs=dofs,
         objectives=objectives,
-        evaluation=evaluation_function,
+        evaluation_function=evaluation_function, 
+        acquisition_plan=simultaneous_acquire,  
         name="peak-sample-map",
         description="Get peak to find the best position for the sample given the energy range specified.",
     )
     agent.dofs
-    # LAST_AGENT = agent
 
     for message in agent.optimize(iterations=iterations):
         if message.command == "set" and message.args == (0.0,):
@@ -234,35 +227,6 @@ def blop_peak_scan(
 
     summary = agent.ax_client.summarize()
     table = summary[motors + ["integrated_signal"]]
-    # class ForPlotting:
-    #     name = ""
-    #     def __init__(self):
-    #         self._current_row = None
-
-    #     def describe(self):
-    #         return {
-    #             name: DataKey(dtype="string", dtype_numpy=[], shape=[], source="PEAK")
-    #             for name in table.columns
-    #         }
-
-    #     def read(self):
-    #         assert self._current_row is not None
-    #         yield PartialEvent(
-    #             data=dict(zip(table.columns, self._current_row)),
-    #             timestamps={name: time.time_ns() for name in table.columns},
-    #             time=time.time_ns(),
-    #         )
-
-    #     def set_row(self, row: list[float]):
-    #         self._current_row = row
-
-    # yield from bps.open_run()
-    # for_plotting = ForPlotting()
-    # for row in table.iterrows():
-    #     print("ROW: ", list(row))
-    #     for_plotting.set_row(list(row))
-    #     yield from bps.one_shot([for_plotting])
-    # yield from bps.close_run()
 
     best_idx = summary["integrated_signal"].idxmax()
     best_signal = summary.loc[best_idx, "integrated_signal"]
