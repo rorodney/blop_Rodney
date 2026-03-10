@@ -1,6 +1,8 @@
-	
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
+# TODO: Examine uv_build for this instead, see if it allows
+# pip install blop[cpu-only], instead of uv pip install blop[cpu-only].
+# It seemed like Thomas would be amenable to adopting UV.
 build-backend = "hatchling.build"
 
 [project]
@@ -25,12 +27,13 @@ dependencies = [
   "ax-platform>=1.1.0,<1.3",
   "bluesky>=1.14.2",
   "bluesky-queueserver-api>=0.0.12",
-  "torch",
   "botorch>=0.16.0",
-  "gpytorch",
   "scipy",
   "networkx>=3",
   "numpy",
+  "torch",
+  "torchvision",
+  "gpytorch"
 ]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -44,6 +47,14 @@ classifiers = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
+ cpu-only = [
+  "torch",
+  "torchvision"
+]
+# All features including GPU support (uses default PyPI index which includes CUDA on Linux)
+#all = [
+#
+#]
 dev = [
   "pytest",
   "ipykernel",
@@ -138,4 +149,33 @@ ignore = [
     "src/blop/tests/",
     "src/blop/bayesian/",  # TODO: Remove this and fix type errors
     "src/blop/ax/qserver_agent.py",  # TODO: Remove this and fix type errors
+]
+
+
+# UV Configuration for PyTorch CPU-only support
+
+# Define the PyTorch CPU-only index
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+# Map packages to the CPU index when using cpu-only extra
+# [tool.uv.sources]
+#torch = [
+#  { index = "pytorch-cpu", extra = "cpu-only" },
+#]
+# gpytorch = [
+#  { index = "pytorch-cpu", extra = "cpu-only" },
+#]
+#botorch = [
+#  { index = "pytorch-cpu", extra = "cpu-only" },
+#]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu-only" },
+]
+torchvision = [
+  { index = "pytorch-cpu", extra = "cpu-only" },
 ]
