@@ -24,12 +24,12 @@ def get_optimization_method(
     energy_range: tuple[float, float],
     peak_spectrum_x_dkey: str,
     peak_spectrum_y_dkey: str,
-):
+): 
     def evaluation_function(
         uid: str, suggestions: list[dict], *args, **kwargs
     ) -> list[dict]:
         # for the integration of the spectrum in the range
-
+        # i'd like the spectrum counts from the IOC as the PV, The Eval function can be just THAT for blop to maximise.
         uid = str(list(db.keys())[-1])
         run = db[uid]
         outcomes = []
@@ -58,6 +58,10 @@ def get_optimization_method(
     return evaluation_function
 
 
+'''
+BLOP's default acquisition plan is to move to the suggested point sequentially
+rather than consecutively-independently, then read
+'''
 @plan
 def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
     if sensors is None:
@@ -220,12 +224,47 @@ def blop_peak_scan(
         name="peak-sample-map",
         description="Get peak to find the best position for the sample given the energy range specified.",
     )
-    agent.dofs
 
-    plt.ion() 
+    '''
+    live plotting setup to visualize optimization progress,
+    integrated siganal and best so far -- as a fucntion of trial number
+    '''
+
+
+    plt.ion()
+    fig_live, ax_live = plt.subplots(figsize=(7, 4))
+    ax_live.set_xlabel("Trials")
+    ax_live.set_ylabel("Integrated signal")
+    ax_live.set_title("live optimization progress")
+    ax_live.grid(True, alpha=0.3)
+    plt.tight_layout()
     plt.show()
 
+    def update_live_plot():
+        summary = agent.ax_client.summarize()
+        if len(summary) == 0:
+            return
+        signal = summary["integrated_signal"].values
+        trials = np.arange(len(signal))
+        best_so_far = np.maximum.accumulate(signal)  # overlay the best so far curve to see convergence
 
+        ax_live.cla()
+        ax_live.set_xlabel("Trials")
+        ax_live.set_ylabel("Integrated signal")
+        ax_live.set_title("live optimization progress")
+        ax_live.grid(True, alpha=0.3)
+        ax_live.plot(trials, signal, marker="o", color="blue", label="signal")
+        ax_live.plot(trials, best_so_far, linestyle="--", color="darkorange", label="best so far")
+        ax_live.legend(loc="lower right")
+        fig_live.canvas.draw()
+        fig_live.canvas.flush_events()
+
+    '''
+    workaround for the actuator bug, run the optimization loop,
+    if motor already at 0 - skip,
+    yielding messages back to the caller after each suggestion and after each run completion (so the live plot can be updated)
+    '''
+    
     for message in agent.optimize(iterations=iterations):
         if message.command == "set" and message.args == (0.0,):
             if (
@@ -238,37 +277,37 @@ def blop_peak_scan(
         else:
             yield message
 
+        # we want to update the live plot after every run completion, which corresponds to a "close_run" message from the agent
+        if message.command == "close_run":
+            update_live_plot()
+
+    plt.ioff()
+    plt.close(fig_live)
 
 
+    # final history plot 
     def plot_optimization_history(agent, motors):
-
         summary = agent.ax_client.summarize()
-
         trial_index = summary.index
         signal = summary["integrated_signal"].values
         best_so_far = np.maximum.accumulate(signal)
 
-        n_motors = len(motors)
-        n_rows = 2 + n_motors 
-
+        n_rows = 2 + len(motors)
         fig = plt.figure(figsize=(10, 3 * n_rows))
         gs = gridspec.GridSpec(n_rows, 1, hspace=0.5)
 
-        # top panel -> raw signal per motor
         ax0 = fig.add_subplot(gs[0])
-        ax0.plot(trial_index, signal, marker="o", linestyle="-", color="blue", label="signal")
+        ax0.plot(trial_index, signal, marker="o", linestyle="-", color="steelblue")
         ax0.set_ylabel("Integrated signal")
         ax0.set_title("Signal per trial")
         ax0.grid(True, alpha=0.3)
 
-        # second panel -> best signal seen so far (convergence curve)
         ax1 = fig.add_subplot(gs[1])
-        ax1.plot(trial_index, best_so_far, marker=".", linestyle="-", color="orange", label="best so far")
+        ax1.plot(trial_index, best_so_far, marker=".", linestyle="-", color="darkorange")
         ax1.set_ylabel("Best signal so far")
         ax1.set_title("Convergence")
         ax1.grid(True, alpha=0.3)
 
-        # for motor space visualization, one panel per motor showing where the optimizer was sampling, coloured by the signal value at that point
         for i, motor_name in enumerate(motors):
             ax = fig.add_subplot(gs[2 + i])
             positions = summary[motor_name].values
@@ -280,18 +319,18 @@ def blop_peak_scan(
             ax.grid(True, alpha=0.3)
 
         ax.set_xlabel("Trial index")
-        plt.suptitle("Optimization history", fontsize=13, y=1.01)
+        plt.suptitle("Optimisation history", fontsize=13, y=1.01)
         plt.show()
 
     plot_optimization_history(agent, motors)
 
+    # move to best and return
     summary = agent.ax_client.summarize()
-    table = summary[motors + ["integrated_signal"]]
-
     best_idx = summary["integrated_signal"].idxmax()
     best_signal = summary.loc[best_idx, "integrated_signal"]
     best_postions = {name: summary.loc[best_idx, name] for name in motors}
 
     for motor_name, value in best_postions.items():
         getattr(manipulator, motor_name.split("_")[-1]).set(value, wait=True)
+
     return best_signal, best_postions
