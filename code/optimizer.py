@@ -11,6 +11,12 @@ import bluesky.plan_stubs as bps
 import bluesky.plans as bp
 from bluesky.utils import plan
 
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+
+
 LAST_AGENT: Agent | None = None
 
 
@@ -57,7 +63,10 @@ def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
     if sensors is None:
         sensors = []
 
-    readables = [s for s in sensors if hasattr(s, "read")]
+    readables = []
+    for s in sensors:
+        if hasattr(s, "read"):
+            readables.append(s)
     md = {"blop_suggestions": suggestions}
 
     def per_step(detectors, step, pos_cache):  # step is a dict of {motor: value}
@@ -203,15 +212,19 @@ def blop_peak_scan(
 
     print("Creating new agent.")
     agent = Agent(
-        sensors=[peak],                          
+        sensors=[peak],
         dofs=dofs,
         objectives=objectives,
-        evaluation_function=evaluation_function, 
-        acquisition_plan=simultaneous_acquire,  
+        evaluation_function=evaluation_function,
+        acquisition_plan=simultaneous_acquire,
         name="peak-sample-map",
         description="Get peak to find the best position for the sample given the energy range specified.",
     )
     agent.dofs
+
+    plt.ion() 
+    plt.show()
+
 
     for message in agent.optimize(iterations=iterations):
         if message.command == "set" and message.args == (0.0,):
@@ -224,6 +237,53 @@ def blop_peak_scan(
                 yield message
         else:
             yield message
+
+
+
+    def plot_optimization_history(agent, motors):
+
+        summary = agent.ax_client.summarize()
+
+        trial_index = summary.index
+        signal = summary["integrated_signal"].values
+        best_so_far = np.maximum.accumulate(signal)
+
+        n_motors = len(motors)
+        n_rows = 2 + n_motors 
+
+        fig = plt.figure(figsize=(10, 3 * n_rows))
+        gs = gridspec.GridSpec(n_rows, 1, hspace=0.5)
+
+        # top panel -> raw signal per motor
+        ax0 = fig.add_subplot(gs[0])
+        ax0.plot(trial_index, signal, marker="o", linestyle="-", color="blue", label="signal")
+        ax0.set_ylabel("Integrated signal")
+        ax0.set_title("Signal per trial")
+        ax0.grid(True, alpha=0.3)
+
+        # second panel -> best signal seen so far (convergence curve)
+        ax1 = fig.add_subplot(gs[1])
+        ax1.plot(trial_index, best_so_far, marker=".", linestyle="-", color="orange", label="best so far")
+        ax1.set_ylabel("Best signal so far")
+        ax1.set_title("Convergence")
+        ax1.grid(True, alpha=0.3)
+
+        # for motor space visualization, one panel per motor showing where the optimizer was sampling, coloured by the signal value at that point
+        for i, motor_name in enumerate(motors):
+            ax = fig.add_subplot(gs[2 + i])
+            positions = summary[motor_name].values
+            sc = ax.scatter(trial_index, positions, c=signal, cmap="viridis", s=60, zorder=3)
+            ax.plot(trial_index, positions, color="gray", linewidth=0.8, alpha=0.5)
+            plt.colorbar(sc, ax=ax, label="signal")
+            ax.set_ylabel(motor_name)
+            ax.set_title(f"{motor_name} position per trial")
+            ax.grid(True, alpha=0.3)
+
+        ax.set_xlabel("Trial index")
+        plt.suptitle("Optimization history", fontsize=13, y=1.01)
+        plt.show()
+
+    plot_optimization_history(agent, motors)
 
     summary = agent.ax_client.summarize()
     table = summary[motors + ["integrated_signal"]]
