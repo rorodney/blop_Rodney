@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from blop.ax import Agent, Objective, RangeDOF
 from bluesky_queueserver import parameter_annotation_decorator
 
@@ -16,8 +17,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 
-
-LAST_AGENT: Agent | None = None
+CHECKPOINT = "sissy1_agent_checkpoint.json"
+#path to checkpoint file json at SISSY1 control machine
 
 
 def get_optimization_method(
@@ -60,7 +61,7 @@ def get_optimization_method(
 
 '''
 BLOP's default acquisition plan is to move to the suggested point sequentially
-rather than consecutively-independently, then read
+rather than simultaneously-independently, then read
 '''
 @plan
 def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
@@ -164,7 +165,7 @@ def blop_peak_scan(
     (r2_start, r2_end) = (min(r2_start, r2_end), max(r2_start, r2_end))
 
     motors, dofs = [], []
-    
+
     if use_x:
         motors.append(manipulator.x.name)
         dofs.append(
@@ -214,16 +215,29 @@ def blop_peak_scan(
         Objective(name="integrated_signal", minimize=False),
     ]
 
-    print("Creating new agent.")
-    agent = Agent(
-        sensors=[peak],
-        dofs=dofs,
-        objectives=objectives,
-        evaluation_function=evaluation_function,
-        acquisition_plan=simultaneous_acquire,
-        name="peak-sample-map",
-        description="Get peak to find the best position for the sample given the energy range specified.",
-    )
+    if os.path.exists(CHECKPOINT):
+        print("Loading agent from checkpoint.")
+        agent = Agent.from_checkpoint(
+            CHECKPOINT,
+            sensors=[peak],
+            actuators=[dof.actuator for dof in dofs],
+            evaluation_function=evaluation_function,
+            acquisition_plan=simultaneous_acquire,
+        )
+        print(f"Loaded agent with {len(agent.ax_client._experiment.trials)} previous trials.")
+    else:
+        print("No checkpoint found, creating new agent.")
+        agent = Agent(
+            sensors=[peak],
+            dofs=dofs,
+            objectives=objectives,
+            evaluation_function=evaluation_function,
+            acquisition_plan=simultaneous_acquire,
+            checkpoint_path=CHECKPOINT,
+            name="peak-sample-map",
+            description="Get peak to find the best position for the sample given the energy range specified.",
+        )
+        print("Created new agent with no previous trials.")
 
     '''
     live plotting setup to visualize optimization progress,
@@ -264,7 +278,7 @@ def blop_peak_scan(
     if motor already at 0 - skip,
     yielding messages back to the caller after each suggestion and after each run completion (so the live plot can be updated)
     '''
-    
+
     for message in agent.optimize(iterations=iterations):
         if message.command == "set" and message.args == (0.0,):
             if (
@@ -283,6 +297,9 @@ def blop_peak_scan(
 
     plt.ioff()
     plt.close(fig_live)
+
+    # final checkpoint to save the state of the agent after optimization is complete
+    agent.checkpoint()
 
 
     # final history plot 
