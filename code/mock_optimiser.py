@@ -26,6 +26,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=FutureWarning, module="ax")
 
 CHECKPOINT = "mock_agent_checkpoint.json"
+agent_container = []
 
 # Mock device classes
 class AlwaysSuccessfulStatus(Status):
@@ -195,7 +196,7 @@ def evaluation_function(uid: str, suggestions: list[dict]) -> list[dict]:
 
 
 # Main plan
-def blop_peak_scan(iterations: int = 15):
+def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors=None, ax_motors=None, wait_timeout=30):
 
     dofs = [
         RangeDOF(actuator=x_motor, bounds=(0, 50), parameter_type="float"),
@@ -231,87 +232,71 @@ def blop_peak_scan(iterations: int = 15):
         )
 
     # live plot setup
+    def update_convergence_plot():
+        if fig_live is None or ax_live is None:
+            return
+        summary = agent.ax_client.summarize()
+        if len(summary) == 0 or "peak_amplitude" not in summary.columns:
+            return
+        signal = summary["peak_amplitude"].values
+        valid = ~np.isnan(signal)
+        if not np.any(valid):
+            return
+        signal = signal[valid]
+        trials = np.arange(len(signal))
+        best_so_far = np.maximum.accumulate(signal)
+        ax_live.cla()
+        ax_live.set_xlabel("Trial")
+        ax_live.set_ylabel("Peak amplitude")
+        ax_live.set_title("Optimisation in progress")
+        ax_live.grid(True, alpha=0.3)
+        ax_live.plot(trials, signal, marker="o", color="darkorange",
+                     linewidth=1.2, markersize=5, label="signal per trial")
+        ax_live.plot(trials, best_so_far, linestyle="--", color="lime",
+                     linewidth=2, label="best so far")
+        ax_live.legend(loc="lower right")
+        fig_live.canvas.draw()
+        fig_live.canvas.flush_events()
 
-    # plt.ion()
-    # fig_live, ax_live = plt.subplots(figsize=(7, 4))
-    # ax_live.set_xlabel("Trial")
-    # ax_live.set_ylabel("Peak amplitude")
-    # ax_live.set_title("live optimization progress")
-    # ax_live.grid(True, alpha=0.3)
-    # plt.tight_layout()
-    # plt.show()
+    def update_motor_plot():
+        if fig_motors is None or ax_motors is None:
+            return
+        summary = agent.ax_client.summarize()
+        if len(summary) == 0 or "peak_amplitude" not in summary.columns:
+            return
+        signal = summary["peak_amplitude"].values
+        valid = ~np.isnan(signal)
+        if not np.any(valid):
+            return
+        signal = signal[valid]
+        trial_index = np.arange(len(signal))
+        for ax_m, motor_name in zip(ax_motors, motors):
+            positions = summary[motor_name].values[:len(signal)]
+            ax_m.cla()
+            sc = ax_m.scatter(trial_index, positions, c=signal, cmap="viridis", s=60, zorder=3)
+            ax_m.plot(trial_index, positions, color="gray", linewidth=0.8, alpha=0.5)
+            ax_m.set_ylabel(motor_name)
+            ax_m.set_title(f"{motor_name} position per trial")
+            ax_m.grid(True, alpha=0.3)
+        ax_motors[-1].set_xlabel("Trial")
+        fig_motors.suptitle("Motor trajectories", fontsize=12)
+        fig_motors.tight_layout()
+        fig_motors.canvas.draw()
+        fig_motors.canvas.flush_events()
 
-    # def update_live_plot():
-    #     summary = agent.ax_client.summarize()
-    #     if len(summary) == 0:
-    #         return
-    #     signal = summary["peak_amplitude"].values
-    #     trials = np.arange(len(signal))
-    #     best_so_far = np.maximum.accumulate(signal)
-    #     ax_live.cla()
-    #     ax_live.set_xlabel("Trial")
-    #     ax_live.set_ylabel("Peak amplitude")
-    #     ax_live.set_title("Optimisation in progress")
-    #     ax_live.grid(True, alpha=0.3)
-    #     ax_live.plot(trials, signal, marker="o", color="darkgreen", label="signal")
-    #     ax_live.plot(trials, best_so_far, linestyle="--", color="darkorange", label="best so far")
-    #     ax_live.legend(loc="lower right")
-    #     fig_live.canvas.draw()
-    #     fig_live.canvas.flush_events()
-
-    # subscribe live plot callback to RE stop documents
-
-    # def on_stop(name, doc):
-    #     if name == "stop":
-    #         update_live_plot()
-    # token = RE.subscribe(on_stop)
-
+    def on_stop(name, doc):
+        if name == "stop":
+            update_convergence_plot()
+            update_motor_plot()
+    token = RE.subscribe(on_stop)
 
     yield from agent.optimize(iterations=iterations)
 
-    # unsubscribe and close live plot
+    RE.unsubscribe(token)
 
-    # RE.unsubscribe(token)
-    # plt.ioff()
-    # plt.close(fig_live)
-
-    # save checkpoint
     agent.checkpoint()
     print(f"Checkpoint saved to {CHECKPOINT}")
 
-    # final history plot
-    
-    # def plot_optimization_history():
-    #     summary = agent.ax_client.summarize()
-    #     trial_index = summary.index
-    #     signal = summary["peak_amplitude"].values
-    #     best_so_far = np.maximum.accumulate(signal)
-    #     n_rows = 2 + len(motors)
-    #     fig = plt.figure(figsize=(10, 3 * n_rows))
-    #     gs = gridspec.GridSpec(n_rows, 1, hspace=0.5)
-    #     ax0 = fig.add_subplot(gs[0])
-    #     ax0.plot(trial_index, signal, marker="o", linestyle="-", color="darkgreen")
-    #     ax0.set_ylabel("Peak amplitude")
-    #     ax0.set_title("Signal per trial")
-    #     ax0.grid(True, alpha=0.3)
-    #     ax1 = fig.add_subplot(gs[1])
-    #     ax1.plot(trial_index, best_so_far, marker=".", linestyle="-", color="darkorange")
-    #     ax1.set_ylabel("Best signal so far")
-    #     ax1.set_title("Convergence")
-    #     ax1.grid(True, alpha=0.3)
-    #     for i, motor_name in enumerate(motors):
-    #         ax = fig.add_subplot(gs[2 + i])
-    #         positions = summary[motor_name].values
-    #         sc = ax.scatter(trial_index, positions, c=signal, cmap="viridis", s=60, zorder=3)
-    #         ax.plot(trial_index, positions, color="gray", linewidth=0.8, alpha=0.5)
-    #         plt.colorbar(sc, ax=ax, label="signal")
-    #         ax.set_ylabel(motor_name)
-    #         ax.set_title(f"{motor_name} position per trial")
-    #         ax.grid(True, alpha=0.3)
-    #     ax.set_xlabel("Trial index")
-    #     plt.suptitle("Optimisation history", fontsize=13, y=1.01)
-    #     plt.show()
-    # plot_optimization_history()
 
     # move to best position and return
     summary = agent.ax_client.summarize()
@@ -335,22 +320,44 @@ def blop_peak_scan(iterations: int = 15):
         motor = {"x": x_motor, "y": y_motor, "theta": theta_motor}[motor_name]
         motor.set(value)
 
+    agent_container.clear()
+    agent_container.append(agent)
     return best_eval, best_positions
-
-
 
 
 if __name__ == "__main__":
 
-    # live plot figure must be created in the main thread before RE runs
-    # plt.ion()
-    # fig_live, ax_live = plt.subplots(figsize=(7, 4))
-    # ax_live.set_xlabel("Trial")
-    # ax_live.set_ylabel("Peak amplitude")
-    # ax_live.set_title("Optimisation in progress")
-    # ax_live.grid(True, alpha=0.3)
-    # plt.tight_layout()
-    # plt.show()
+    plt.style.use("dark_background")
+    plt.ion()
 
-    result = RE(blop_peak_scan(iterations=30))
+    fig_live, ax_live = plt.subplots(figsize=(9, 4))
+    ax_live.set_xlabel("Trial")
+    ax_live.set_ylabel("Peak amplitude")
+    ax_live.set_title("Optimisation in progress")
+    ax_live.grid(True, alpha=0.3)
+    fig_live.tight_layout()
+
+    n_motors = 3  # x, y, theta
+    fig_motors, ax_motors = plt.subplots(n_motors, 1, figsize=(9, 3 * n_motors), sharex=True)
+    fig_motors.suptitle("Motor trajectories", fontsize=12)
+    fig_motors.tight_layout()
+
+    plt.show()
+
+    result = RE(blop_peak_scan(
+        iterations=30,
+        fig_live=fig_live,
+        ax_live=ax_live,
+        fig_motors=fig_motors,
+        ax_motors=ax_motors,
+    ))
+
+    agent = agent_container[0]
+    motors = ["x", "y", "theta"]
+
+    print(agent.ax_client.summarize()[["x", "y", "theta", "peak_amplitude"]].to_string())
+
+    plt.ioff()
+    plt.show(block=True)
+
     tiled_server.close()
