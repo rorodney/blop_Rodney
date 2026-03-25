@@ -244,7 +244,6 @@ def blop_peak_scan(
     integrated siganal and best so far -- as a fucntion of trial number
     '''
 
-
     plt.ion()
     fig_live, ax_live = plt.subplots(figsize=(7, 4))
     ax_live.set_xlabel("Trials")

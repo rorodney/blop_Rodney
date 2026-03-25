@@ -5,7 +5,6 @@ from typing import Any
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 import bluesky.plan_stubs as bps
 from bluesky.protocols import NamedMovable, Readable, Status, Hints, HasHints, HasParent
@@ -17,10 +16,19 @@ from tiled.client import from_uri
 from tiled.server import SimpleTiledServer
 
 from blop.ax import Agent, RangeDOF, Objective
+from blop.plans import default_acquire
 import warnings
 
 import blop
 print(blop.__version__)
+
+from ax.generation_strategy.generation_node import GenerationNode
+from ax.generation_strategy.generation_strategy import GenerationStrategy
+from ax.generation_strategy.generator_spec import GeneratorSpec
+from ax.generation_strategy.transition_criterion import MinTrials
+from ax.adapter.registry import Generators
+from botorch.acquisition.logei import qLogExpectedImprovement
+
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=FutureWarning, module="ax")
@@ -28,7 +36,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="ax")
 CHECKPOINT = "mock_agent_checkpoint.json"
 agent_container = []
 
-# Mock device classes
+
 class AlwaysSuccessfulStatus(Status):
 
     def add_callback(self, callback) -> None:
@@ -83,6 +91,7 @@ class MovableSignal(ReadableSignal, NamedMovable):
 
 
 # Tiled / RunEngine setup
+
 RE = RunEngine({})
 
 if 'tiled_server' not in globals() or not hasattr(tiled_server, 'uri'):
@@ -92,6 +101,7 @@ if 'tiled_server' not in globals() or not hasattr(tiled_server, 'uri'):
     print("Created new Tiled server and RunEngine")
 
 RE.subscribe(tiled_writer)
+
 
 # Spectrum simulator
 x_peak = 13.0
@@ -103,7 +113,7 @@ stheta1 = 15.0
 A0 = 1000.0
 peak_width = 50.0
 E0 = 650.0
-noise_factor = 0
+noise_factor = 0.01
 
 energy_range = (649.5, 650.5)
 
@@ -145,40 +155,48 @@ x_motor = MovableSignal("x", initial_value=0.0)
 y_motor = MovableSignal("y", initial_value=0.0)
 theta_motor = MovableSignal("theta", initial_value=0.0)
 
-# BLOP requires at least one sensor even though the evaluation function reads directly from tiled rather than from the sensor itself
+# BLOP requires at least one sensor even if the evaluation function does not
+# read from it - it is a placeholder to satisfy the API
 dummy_sensor = ReadableSignal("dummy_sensor")
 
 
-# Acquisition plan: move all motors simultaneously then read
-# trying to use low-level plan stubs to avoid opening a nested run inside BLOP's
-# outer run wrapper -- bp.list_scan cannot be used here for that reason
+# Acquisition plan
+# Moves all motors simultaneously using a custom per_step injected into
+# BLOP's default_acquire. bp.list_scan cannot be used here because it would
+# open a nested run inside BLOP's outer run wrapper.
+def make_simultaneous_per_step(actuators):
+    """
+    Returns a per_step callable that moves all motors simultaneously
+    instead of the default sequential move, then triggers and reads detectors.
+    """
+    def simultaneous_per_step(detectors, step, pos_cache):
+        move_args = []
+        for motor, value in step.items():
+            move_args.extend([motor, value])
+        yield from bps.mv(*move_args)
+        yield from bps.trigger_and_read(list(detectors))
+    return simultaneous_per_step
 
 
-# @plan
-# def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
-#     if sensors is None:
-#         sensors = []
-
-#     readables = []
-#     for s in sensors:
-#         if hasattr(s, "read"):
-#             readables.append(s)
-
-#     for suggestion in suggestions:
-#         move_args = []
-#         for actuator in actuators:
-#             move_args.extend([actuator, suggestion[actuator.name]])
-#         yield from bps.mv(*move_args)
+@plan
+def simultaneous_acquire(suggestions, actuators, sensors=None, **kwargs):
+    if sensors is None:
+        sensors = []
+    per_step = make_simultaneous_per_step(actuators)
+    return (yield from default_acquire(
+        suggestions,
+        actuators,
+        sensors,
+        per_step=per_step,
+        **kwargs,
+    ))
 
 
 # Evaluation function
-# reads the last run from tiled since the installed BLOP version does not
-# pass the uid correctly to the evaluation function
-
-
+# Reads motor positions directly from the suggestion dict and computes the
+# integrated spectrum analytically. No tiled read needed for the mock.
 def evaluation_function(uid: str, suggestions: list[dict]) -> list[dict]:
     outcomes = []
-
     for suggestion in suggestions:
         idx = suggestion["_id"]
         x = suggestion["x"]
@@ -195,9 +213,49 @@ def evaluation_function(uid: str, suggestions: list[dict]) -> list[dict]:
     return outcomes
 
 
-# Main plan
-def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors=None, ax_motors=None, wait_timeout=30):
+def make_generation_strategy(n_dofs: int) -> GenerationStrategy:
+    sobol_trials = n_dofs + 1
 
+    return GenerationStrategy(
+        name="ShortSobol+ExploitBoTorch",
+        nodes=[
+            GenerationNode(
+                name="Sobol",
+                generator_specs=[GeneratorSpec(generator_enum=Generators.SOBOL, model_kwargs={"seed": 42},)],
+                transition_criteria=[MinTrials(threshold=sobol_trials, transition_to="BoTorch", use_all_trials_in_exp=True,)],
+            ),
+            GenerationNode(
+                name="BoTorch",
+                generator_specs=[
+                    GeneratorSpec(
+                        generator_enum=Generators.BOTORCH_MODULAR,
+                        model_kwargs={
+                            # qLogExpectedImprovement: suggests points likely to improve over the current best, with no explicit exploration term
+                            "botorch_acqf_class": qLogExpectedImprovement,
+                        },
+                        model_gen_kwargs={
+                            "optimizer_kwargs": {
+                                # num_restarts: how many starting points to sample when optimizing the acquisition function. More is more robust but slower.
+                                "num_restarts": 10,
+                                # raw_samples: how many candidates to sample when
+                                "raw_samples": 512,
+                            },
+                        },
+                    )
+                ],
+            ),
+        ],
+    )
+
+
+
+def blop_peak_scan(
+    iterations: int = 15,
+    fig_live=None,
+    ax_live=None,
+    fig_motors=None,
+    ax_motors=None,
+):
     dofs = [
         RangeDOF(actuator=x_motor, bounds=(0, 50), parameter_type="float"),
         RangeDOF(actuator=y_motor, bounds=(0, 50), parameter_type="float"),
@@ -205,10 +263,9 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
     ]
 
     objectives = [Objective(name="peak_amplitude", minimize=False)]
-
     motors = [dof.actuator.name for dof in dofs]
 
-    # checkpoint: resume if available, otherwise start fresh
+    # checkpoint: resume if available, otherwise start fresh 
     if os.path.exists(CHECKPOINT):
         print("Checkpoint found, resuming from saved model.")
         agent = Agent.from_checkpoint(
@@ -216,8 +273,9 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
             sensors=[dummy_sensor],
             actuators=[x_motor, y_motor, theta_motor],
             evaluation_function=evaluation_function,
-            # acquisition_plan=simultaneous_acquire,
+            acquisition_plan=simultaneous_acquire,
         )
+        # from_checkpoint bypasses __init__ so _readable_cache is not set
         agent._readable_cache = {}
     else:
         print("No checkpoint found, creating new agent.")
@@ -226,12 +284,16 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
             dofs=dofs,
             objectives=objectives,
             evaluation_function=evaluation_function,
-            # acquisition_plan=simultaneous_acquire,
+            acquisition_plan=simultaneous_acquire,
             checkpoint_path=CHECKPOINT,
             name="mock-peak-scan",
         )
 
-    # live plot setup
+
+    generation_strategy = make_generation_strategy(n_dofs=len(dofs))
+    agent.ax_client.set_generation_strategy(generation_strategy)
+
+    # --- live plot update functions
     def update_convergence_plot():
         if fig_live is None or ax_live is None:
             return
@@ -250,11 +312,13 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
         ax_live.set_ylabel("Peak amplitude")
         ax_live.set_title("Optimisation in progress")
         ax_live.grid(True, alpha=0.3)
+        ax_live.fill_between(trials, signal, alpha=0.08, color="darkorange")
         ax_live.plot(trials, signal, marker="o", color="darkorange",
                      linewidth=1.2, markersize=5, label="signal per trial")
         ax_live.plot(trials, best_so_far, linestyle="--", color="lime",
                      linewidth=2, label="best so far")
         ax_live.legend(loc="lower right")
+        fig_live.tight_layout()
         fig_live.canvas.draw()
         fig_live.canvas.flush_events()
 
@@ -270,17 +334,24 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
             return
         signal = signal[valid]
         trial_index = np.arange(len(signal))
+
+        sc_last = None
         for ax_m, motor_name in zip(ax_motors, motors):
             positions = summary[motor_name].values[:len(signal)]
             ax_m.cla()
-            sc = ax_m.scatter(trial_index, positions, c=signal, cmap="viridis", s=60, zorder=3)
-            ax_m.plot(trial_index, positions, color="gray", linewidth=0.8, alpha=0.5)
+            ax_m.plot(trial_index, positions, color="gray", linewidth=0.8, alpha=0.5, zorder=2)
+            sc_last = ax_m.scatter(
+                trial_index, positions, c=signal,
+                cmap="plasma", s=55, zorder=3,
+                vmin=signal.min(), vmax=signal.max(),
+                edgecolors="none",
+            )
             ax_m.set_ylabel(motor_name)
-            ax_m.set_title(f"{motor_name} position per trial")
+            ax_m.set_title(motor_name)
             ax_m.grid(True, alpha=0.3)
+
         ax_motors[-1].set_xlabel("Trial")
         fig_motors.suptitle("Motor trajectories", fontsize=12)
-        fig_motors.tight_layout()
         fig_motors.canvas.draw()
         fig_motors.canvas.flush_events()
 
@@ -288,6 +359,7 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
         if name == "stop":
             update_convergence_plot()
             update_motor_plot()
+
     token = RE.subscribe(on_stop)
 
     yield from agent.optimize(iterations=iterations)
@@ -298,7 +370,6 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
     print(f"Checkpoint saved to {CHECKPOINT}")
 
 
-    # move to best position and return
     summary = agent.ax_client.summarize()
     print(summary[["x", "y", "theta", "peak_amplitude"]].to_string())
 
@@ -307,14 +378,12 @@ def blop_peak_scan(iterations: int = 15, fig_live=None, ax_live=None, fig_motors
     best_y = summary.loc[best_idx, "y"]
     best_theta = summary.loc[best_idx, "theta"]
     best_eval = summary.loc[best_idx, "peak_amplitude"]
-
     best_positions = {name: summary.loc[best_idx, name] for name in motors}
 
-
-    print(f"Best x: {best_x}")
-    print(f"Best y: {best_y}")
-    print(f"Best theta: {best_theta}")
-    print(f"Best evaluation value: {best_eval}")
+    print(f"Best x:     {best_x:.4f}")
+    print(f"Best y:     {best_y:.4f}")
+    print(f"Best theta: {best_theta:.4f}")
+    print(f"Best eval:  {best_eval:.4f}")
 
     for motor_name, value in best_positions.items():
         motor = {"x": x_motor, "y": y_motor, "theta": theta_motor}[motor_name]
@@ -330,6 +399,7 @@ if __name__ == "__main__":
     plt.style.use("dark_background")
     plt.ion()
 
+    # signal + convergence window
     fig_live, ax_live = plt.subplots(figsize=(9, 4))
     ax_live.set_xlabel("Trial")
     ax_live.set_ylabel("Peak amplitude")
@@ -337,8 +407,10 @@ if __name__ == "__main__":
     ax_live.grid(True, alpha=0.3)
     fig_live.tight_layout()
 
-    n_motors = 3  # x, y, theta
+    # motor trajectories window
+    n_motors = 3
     fig_motors, ax_motors = plt.subplots(n_motors, 1, figsize=(9, 3 * n_motors), sharex=True)
+    fig_motors._blop_cbar = None
     fig_motors.suptitle("Motor trajectories", fontsize=12)
     fig_motors.tight_layout()
 
