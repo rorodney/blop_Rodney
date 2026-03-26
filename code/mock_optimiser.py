@@ -28,7 +28,7 @@ from ax.generation_strategy.generator_spec import GeneratorSpec
 from ax.generation_strategy.transition_criterion import MinTrials
 from ax.adapter.registry import Generators
 from botorch.acquisition.logei import qLogExpectedImprovement
-
+from botorch.acquisition.monte_carlo import qUpperConfidenceBound
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=FutureWarning, module="ax")
@@ -231,7 +231,9 @@ def make_generation_strategy(n_dofs: int) -> GenerationStrategy:
                         generator_enum=Generators.BOTORCH_MODULAR,
                         model_kwargs={
                             # qLogExpectedImprovement: suggests points likely to improve over the current best, with no explicit exploration term
-                            "botorch_acqf_class": qLogExpectedImprovement,
+                            # "botorch_acqf_class": qLogExpectedImprovement,
+                            "botorch_acqf_class": qUpperConfidenceBound,
+                            "acquisition_options": {"beta": 0.5},
                         },
                         model_gen_kwargs={
                             "optimizer_kwargs": {
@@ -417,7 +419,7 @@ if __name__ == "__main__":
     plt.show()
 
     result = RE(blop_peak_scan(
-        iterations=30,
+        iterations=15,
         fig_live=fig_live,
         ax_live=ax_live,
         fig_motors=fig_motors,
@@ -426,8 +428,6 @@ if __name__ == "__main__":
 
     agent = agent_container[0]
     motors = ["x", "y", "theta"]
-
-    print(agent.ax_client.summarize()[["x", "y", "theta", "peak_amplitude"]].to_string())
 
     plt.ioff()
     plt.show(block=True)
